@@ -7,7 +7,6 @@ from ultralytics import YOLO, settings
 from src import config
 
 # Update YOLO settings with a relative path for portability
-# This sets the download location to './datasets' inside the project
 print(f"[*] Updating YOLO datasets path to: datasets")
 settings.update({'datasets_dir': 'datasets'})
 
@@ -19,17 +18,36 @@ class ExperimentRunner:
         self.results = {}
         self.style_scores = {}
 
-        # USE RELATIVE PATHS for portability (GitHub friendly)
         self.output_root = 'replication_results'
         os.makedirs(self.output_root, exist_ok=True)
 
-        # Dedicated folder for the final model
         self.model_dir = 'model'
         os.makedirs(self.model_dir, exist_ok=True)
 
-        # Construct the final path using the config name + .pt
         self.final_model_filename = f"{config.MODEL_NAME}.pt"
         self.final_model_path = os.path.join(self.model_dir, self.final_model_filename)
+
+    def _create_strict_yaml(self, filename='peopleart_strict.yaml'):
+        """
+        Dynamically creates a YAML file that strictly enforces the 'person' class.
+        This mirrors the logic from Phase 4 to ensure consistency.
+        """
+        dataset_root = os.path.abspath(config.DATASET_DIR)
+
+        conf = {
+            'path': dataset_root,
+            'train': 'images/train',
+            'val': 'images/val',
+            'test': 'images/test',
+            # We explicitly define ONLY class 0.
+            # YOLO might warn about missing classes 1-79 but will focus on 0.
+            'names': {0: 'person'}
+        }
+
+        with open(filename, 'w') as f:
+            yaml.dump(conf, f, sort_keys=False)
+
+        return filename
 
     def _ensure_local_coco_yaml(self):
         local_yaml_path = 'coco_local.yaml'
@@ -40,11 +58,9 @@ class ExperimentRunner:
             pkg_path = Path(ultralytics.__file__).parent
             default_yaml = pkg_path / 'cfg' / 'datasets' / 'coco.yaml'
 
-            # FIX: Encoding set to utf-8 to prevent Windows crash
             with open(default_yaml, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f)
 
-            # Use relative path for portability
             data['path'] = 'datasets/coco'
 
             with open(local_yaml_path, 'w', encoding='utf-8') as f:
@@ -59,6 +75,8 @@ class ExperimentRunner:
         coco_yaml_file = self._ensure_local_coco_yaml()
 
         # Output: replication_results/01_Baseline/coco_eval
+        # We explicitly pass classes=[0] to filter METRICS.
+        # Visuals might still show other classes because it's a pre-trained 80-class model.
         res = self.model.val(
             data=coco_yaml_file,
             split='val',
@@ -74,10 +92,16 @@ class ExperimentRunner:
     def run_phase_2_zero_shot(self):
         print("\n--- PHASE 2: CROSS-DEPICTION TEST (ZERO-SHOT) ---")
 
+        # Use strictly defined YAML
+        strict_yaml = self._create_strict_yaml()
+
         # Output: replication_results/02_ZeroShot/peopleart_eval
+        # Even with the strict YAML, the model still has 80 heads.
+        # We rely on classes=[0] to filter.
         res = self.model.val(
-            data='peopleart_replication.yaml',
+            data=strict_yaml,
             split='test',
+            classes=[0],
             verbose=False,
             project=os.path.join(self.output_root, '02_ZeroShot'),
             name='peopleart_eval',
@@ -89,7 +113,6 @@ class ExperimentRunner:
     def run_phase_3_adaptation(self):
         print("\n--- PHASE 3: ADAPTATION (FINE-TUNING) ---")
 
-        # Check if we already have a trained model
         if os.path.exists(self.final_model_path):
             print(f"[*] Found persistent model at: {self.final_model_path}")
             print("[*] Skipping training and loading existing weights...")
@@ -97,11 +120,15 @@ class ExperimentRunner:
         else:
             print(f"[*] Training for {config.EPOCHS} epochs (Patience={config.PATIENCE})...")
 
+            strict_yaml = self._create_strict_yaml()
             project_path = os.path.join(self.output_root, '03_Adaptation')
             name = 'training_run'
 
+            # During training, the model ADAPTS to the dataset.
+            # Since strict_yaml only has 1 class, the model head will be replaced
+            # with a 1-class head automatically by YOLO.
             self.model.train(
-                data='peopleart_replication.yaml',
+                data=strict_yaml,
                 epochs=config.EPOCHS,
                 patience=config.PATIENCE,
                 imgsz=config.IMG_SIZE,
@@ -110,14 +137,13 @@ class ExperimentRunner:
                 plots=False,
                 project=project_path,
                 name=name,
-                exist_ok=True
+                exist_ok=True,
+                # Force single class mode during training
+                single_cls=True
             )
 
-            # --- ROBUST PATH DETECTION ---
-            # 1. Expected Path (Relative)
+            # Robust Path Detection for saving
             expected_path = os.path.join(project_path, name, 'weights', 'best.pt')
-
-            # 2. Fallback Path (YOLO default nesting in runs/detect)
             fallback_path = os.path.join('runs', 'detect', project_path, name, 'weights', 'best.pt')
 
             source_path = None
@@ -127,21 +153,21 @@ class ExperimentRunner:
                 print(f"[*] Note: Model found in fallback location: {fallback_path}")
                 source_path = fallback_path
 
-            # Copy to our persistent 'model' folder with the CUSTOM NAME
             if source_path:
                 print(f"[*] Saving best model to persistent storage: {self.final_model_path}")
                 shutil.copy(source_path, self.final_model_path)
                 self.model = YOLO(self.final_model_path)
             else:
                 print(f"[!] Warning: Training finished but 'best.pt' was not found.")
-                print(f"    Checked: {expected_path}")
-                print(f"    Checked: {fallback_path}")
 
         print("[*] Re-evaluating fine-tuned model...")
+        strict_yaml = self._create_strict_yaml()
 
+        # Now the model IS a 1-class model (if trained), so classes=[0] is redundant but safe.
         res = self.model.val(
-            data='peopleart_replication.yaml',
+            data=strict_yaml,
             split='test',
+            classes=[0],
             verbose=False,
             project=os.path.join(self.output_root, '03_Adaptation'),
             name='finetuned_eval',
@@ -159,12 +185,15 @@ class ExperimentRunner:
 
         temp_yaml = 'temp_style_eval.yaml'
         self.results['Style Breakdown'] = {}
+        dataset_root = os.path.abspath(config.DATASET_DIR)
 
         for sf in style_files:
             style_name = os.path.splitext(os.path.basename(sf))[0]
+
             conf = {
-                'path': os.path.abspath(config.DATASET_DIR),
-                'train': sf, 'val': sf, 'names': {0: 'person'}
+                'path': dataset_root,
+                'train': sf, 'val': sf,
+                'names': {0: 'person'}
             }
             with open(temp_yaml, 'w') as f:
                 yaml.dump(conf, f)
@@ -172,6 +201,7 @@ class ExperimentRunner:
                 res = self.model.val(
                     data=temp_yaml,
                     split='val',
+                    classes=[0],
                     verbose=False,
                     project=os.path.join(self.output_root, '04_StyleAnalysis'),
                     name=style_name,
@@ -210,13 +240,11 @@ class ExperimentRunner:
         print(f"   Westlake (2016): {config.WESTLAKE_2016_BASELINE}")
         print(f"   YOLOv8 (2025):   {self.results.get('Art (Zero-Shot)', 0):.3f}")
 
-        # Save complete detailed data to JSON
         json_path = os.path.join(self.output_root, 'final_report.json')
         with open(json_path, 'w') as f:
             json.dump(self.results, f, indent=4)
         print(f"[*] Detailed results saved to {json_path}")
 
-        # Save Text Report
         txt_path = os.path.join(self.output_root, 'final_report.txt')
         with open(txt_path, 'w') as f:
             f.write("=== REPLICATION STUDY RESULTS ===\n")
@@ -229,6 +257,5 @@ class ExperimentRunner:
                     f.write(f"{k}: {v:.4f}\n")
         print(f"[*] Text summary saved to {txt_path}")
 
-        # Filter results for plotting (Numbers only)
         plot_data = {k: v for k, v in self.results.items() if isinstance(v, (int, float))}
         return plot_data
